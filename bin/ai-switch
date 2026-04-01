@@ -1,0 +1,1015 @@
+#!/bin/zsh
+# ai-switch: Multi-account manager for OpenCode/Codex CLI
+# https://github.com/yizhen0322/ai-switch
+#
+# Usage: ai [command] [account]
+# Config: ~/.config/ai-accounts.conf
+
+set -e
+
+# Directory paths
+DATA_HOME_ROOT="$HOME/.local/share"
+CONFIG_HOME_ROOT="$HOME/.config"
+STATE_HOME_ROOT="$HOME/.local/state"
+USAGE_FILE="$HOME/.local/share/ai-usage.json"
+ACCOUNTS_CONF="$HOME/.config/ai-accounts.conf"
+BASE_CONFIG="$HOME/.config/opencode"
+
+# Terminal colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+MAGENTA='\033[0;35m'
+NC='\033[0m'
+BOLD='\033[1m'
+DIM='\033[2m'
+
+# Account data structures
+declare -A ACCOUNT_TYPES
+declare -A ACCOUNT_SHORTCUTS
+declare -A ACCOUNT_NAMES
+declare -A SHORTCUT_TO_ACCOUNT
+ACCOUNTS=()
+
+# =============================================================================
+# Account Configuration
+# =============================================================================
+
+load_accounts() {
+  if [[ ! -f "$ACCOUNTS_CONF" ]]; then
+    echo -e "${RED}Config not found: $ACCOUNTS_CONF${NC}"
+    echo "Run: ai setup"
+    return 1
+  fi
+  
+  while IFS=: read -r name type shortcut display_name; do
+    [[ "$name" =~ ^#.*$ || -z "$name" ]] && continue
+    
+    ACCOUNTS+=("$name")
+    ACCOUNT_TYPES[$name]="$type"
+    ACCOUNT_SHORTCUTS[$name]="$shortcut"
+    ACCOUNT_NAMES[$name]="${display_name:-}"
+    SHORTCUT_TO_ACCOUNT[$shortcut]="$name"
+  done < "$ACCOUNTS_CONF"
+}
+
+get_account_data_home() {
+  echo "$DATA_HOME_ROOT/opencode-$1"
+}
+
+get_account_data_dir() {
+  echo "$(get_account_data_home "$1")/opencode"
+}
+
+get_account_auth_file() {
+  echo "$(get_account_data_dir "$1")/auth.json"
+}
+
+get_account_config_home() {
+  echo "$CONFIG_HOME_ROOT/opencode-$1"
+}
+
+get_account_state_home() {
+  echo "$STATE_HOME_ROOT/opencode-$1"
+}
+
+# =============================================================================
+# Usage Tracking & Rate Limits
+# =============================================================================
+
+init_usage() {
+  if [[ ! -f "$USAGE_FILE" ]]; then
+    echo '{}' > "$USAGE_FILE"
+  fi
+}
+
+record_account_usage_timestamp() {
+  local acc="$1"
+  local now=$(date +%s)
+  local tmp=$(mktemp)
+
+  jq --arg acc "$acc" --argjson now "$now" '
+    .[$acc] = (
+      if (.[$acc] | type) == "object" then
+        .[$acc] + {lastUsedAt: $now}
+      else
+        {lastUsedAt: $now}
+      end
+    )
+  ' "$USAGE_FILE" > "$tmp" 2>/dev/null && mv "$tmp" "$USAGE_FILE"
+}
+
+cache_rate_limits() {
+  local acc="$1"
+  local response="$2"
+  local now=$(date +%s)
+  local tmp=$(mktemp)
+
+  jq --arg acc "$acc" --argjson now "$now" --argjson rate "$response" '
+    .[$acc] = (
+      if (.[$acc] | type) == "object" then
+        .[$acc] + {lastRateLimits: $rate, lastRateLimitsAt: $now}
+      else
+        {lastRateLimits: $rate, lastRateLimitsAt: $now}
+      end
+    )
+  ' "$USAGE_FILE" > "$tmp" 2>/dev/null && mv "$tmp" "$USAGE_FILE"
+}
+
+format_reset_time() {
+  local resets_at="$1"
+  if [[ -n "$resets_at" && "$resets_at" != "null" && "$resets_at" -gt 0 ]]; then
+    date -r "$resets_at" "+%H:%M on %d %b" 2>/dev/null || echo "unknown"
+  else
+    echo "unknown"
+  fi
+}
+
+get_window_label() {
+  local window_mins="$1"
+  case "$window_mins" in
+    300) echo "5h limit" ;;
+    10080) echo "Weekly limit" ;;
+    1440) echo "Daily limit" ;;
+    *) echo "${window_mins}m limit" ;;
+  esac
+}
+
+format_limit_compact() {
+  local used="$1"
+  local resets_at="$2"
+  local reset_formatted=$(format_reset_time "$resets_at")
+  local remaining=$((100 - used))
+  [[ "$remaining" -lt 0 ]] && remaining=0
+  printf '%s' "${remaining}% left (${reset_formatted})"
+}
+
+display_limit_window() {
+  local label="$1"
+  local used="$2"
+  local resets_at="$3"
+  local reset_formatted=$(format_reset_time "$resets_at")
+  local remaining=$((100 - used))
+  [[ "$remaining" -lt 0 ]] && remaining=0
+  
+  local bar_length=20
+  local filled=$((bar_length * used / 100))
+  local empty=$((bar_length - filled))
+  local bar=""
+
+  for ((i=0; i<filled; i++)); do bar+="█"; done
+  for ((i=0; i<empty; i++)); do bar+="░"; done
+
+  local prefix=""
+  [[ -n "$label" ]] && prefix="${label}: "
+
+  if [[ "$used" -ge 100 ]]; then
+    echo -e "  ${prefix}${RED}${bar}${NC} ${RED}${remaining}% left${NC} (${reset_formatted})"
+  elif [[ "$used" -ge 80 ]]; then
+    echo -e "  ${prefix}${YELLOW}${bar}${NC} ${YELLOW}${remaining}% left${NC} (${reset_formatted})"
+  else
+    echo -e "  ${prefix}${GREEN}${bar}${NC} ${remaining}% left (${reset_formatted})"
+  fi
+}
+
+get_cached_limit_summary() {
+  local acc="$1"
+  local response=$(jq -c --arg acc "$acc" '
+    .[$acc]
+    | if type == "object" then .lastRateLimits // empty else empty end
+  ' "$USAGE_FILE" 2>/dev/null)
+
+  [[ -z "$response" || "$response" == "null" ]] && return
+
+  local primary_used=$(printf '%s\n' "$response" | jq -r '.rateLimits.primary.usedPercent // empty' 2>/dev/null)
+  local primary_window=$(printf '%s\n' "$response" | jq -r '.rateLimits.primary.windowDurationMins // empty' 2>/dev/null)
+  local primary_resets=$(printf '%s\n' "$response" | jq -r '.rateLimits.primary.resetsAt // 0' 2>/dev/null)
+  local secondary_used=$(printf '%s\n' "$response" | jq -r '.rateLimits.secondary.usedPercent // empty' 2>/dev/null)
+  local secondary_window=$(printf '%s\n' "$response" | jq -r '.rateLimits.secondary.windowDurationMins // empty' 2>/dev/null)
+  local secondary_resets=$(printf '%s\n' "$response" | jq -r '.rateLimits.secondary.resetsAt // 0' 2>/dev/null)
+
+  if [[ -n "$secondary_used" ]]; then
+    printf '%s | %s' \
+      "$(get_window_label "$primary_window") $(format_limit_compact "$primary_used" "$primary_resets")" \
+      "$(get_window_label "$secondary_window") $(format_limit_compact "$secondary_used" "$secondary_resets")"
+  elif [[ -n "$primary_used" ]]; then
+    printf '%s' "$(format_limit_compact "$primary_used" "$primary_resets")"
+  fi
+}
+
+# Fetch rate limits from Codex app-server via JSON-RPC
+get_codex_usage() {
+  local codex_home="$1"
+  local auth_file="$codex_home/auth.json"
+  local init_request=$(jq -cn '{jsonrpc:"2.0",id:1,method:"initialize",params:{clientInfo:{name:"ai-switch",version:"1.0.0"},capabilities:{experimentalApi:true}}}')
+  local login_request=""
+  local rate_request_id=2
+
+  if [[ -f "$auth_file" ]] && jq -e '.openai? != null' "$auth_file" >/dev/null 2>&1; then
+    local access_token=$(jq -r '.openai.access // empty' "$auth_file" 2>/dev/null)
+    local account_id=$(jq -r '.openai.accountId // empty' "$auth_file" 2>/dev/null)
+
+    if [[ -n "$access_token" && -n "$account_id" ]]; then
+      login_request=$(jq -cn \
+        --arg accessToken "$access_token" \
+        --arg chatgptAccountId "$account_id" \
+        '{jsonrpc:"2.0",id:2,method:"account/login/start",params:{type:"chatgptAuthTokens",accessToken:$accessToken,chatgptAccountId:$chatgptAccountId,chatgptPlanType:null}}')
+      rate_request_id=3
+    fi
+  fi
+
+  local rate_request=$(jq -cn --argjson id "$rate_request_id" '{jsonrpc:"2.0",id:$id,method:"account/rateLimits/read",params:null}')
+
+  local response=$({
+    printf '%s\n' "$init_request"
+    sleep 1
+    if [[ -n "$login_request" ]]; then
+      printf '%s\n' "$login_request"
+      sleep 1
+    fi
+    printf '%s\n' "$rate_request"
+    sleep 4
+  } | CODEX_HOME="$codex_home" codex app-server 2>/dev/null)
+
+  local result=$(printf '%s\n' "$response" | jq -cr "select(.id == $rate_request_id) | .result // empty" 2>/dev/null)
+  [[ -n "$result" && "$result" != "null" ]] && printf '%s\n' "$result"
+}
+
+refresh_rate_limits_cache() {
+  local acc="$1"
+  local codex_home="$2"
+  local response=$(get_codex_usage "$codex_home")
+
+  if [[ -n "$response" ]]; then
+    cache_rate_limits "$acc" "$response"
+    return 0
+  fi
+  return 1
+}
+
+display_rate_limits() {
+  local codex_home=$1
+  local acc=${2:-}
+  local response=$(get_codex_usage "$codex_home")
+  
+  [[ -z "$response" ]] && return 1
+
+  [[ -n "$acc" ]] && cache_rate_limits "$acc" "$response"
+  
+  local primary_used=$(echo "$response" | jq -r '.rateLimits.primary.usedPercent // 0' 2>/dev/null)
+  local primary_resets=$(echo "$response" | jq -r '.rateLimits.primary.resetsAt // 0' 2>/dev/null)
+  local primary_window=$(echo "$response" | jq -r '.rateLimits.primary.windowDurationMins // 0' 2>/dev/null)
+  local secondary_used=$(echo "$response" | jq -r '.rateLimits.secondary.usedPercent // empty' 2>/dev/null)
+  local secondary_window=$(echo "$response" | jq -r '.rateLimits.secondary.windowDurationMins // empty' 2>/dev/null)
+  local secondary_resets=$(echo "$response" | jq -r '.rateLimits.secondary.resetsAt // 0' 2>/dev/null)
+  local plan_type=$(echo "$response" | jq -r '.rateLimits.planType // "unknown"' 2>/dev/null)
+  local has_credits=$(echo "$response" | jq -r '.rateLimits.credits.hasCredits // false' 2>/dev/null)
+  local credits_balance=$(echo "$response" | jq -r '.rateLimits.credits.balance // 0' 2>/dev/null)
+  
+  echo ""
+  echo -e "${BOLD}Usage Limits:${NC}"
+
+  if [[ -n "$secondary_used" ]]; then
+    display_limit_window "$(get_window_label "$primary_window")" "$primary_used" "$primary_resets"
+    display_limit_window "$(get_window_label "$secondary_window")" "$secondary_used" "$secondary_resets"
+  else
+    display_limit_window "" "$primary_used" "$primary_resets"
+  fi
+  
+  if [[ "$has_credits" == "true" && "$credits_balance" -gt 0 ]]; then
+    echo -e "  Credits: ${BOLD}${credits_balance}${NC}"
+  fi
+  
+  echo -e "  Plan: ${BOLD}${plan_type}${NC}"
+  return 0
+}
+
+# =============================================================================
+# Account Information
+# =============================================================================
+
+get_opencode_account_email() {
+  local codex_home="$1"
+  local auth_file="$codex_home/auth.json"
+
+  if [[ ! -f "$auth_file" ]] || ! jq -e '.openai? != null' "$auth_file" >/dev/null 2>&1; then
+    return
+  fi
+
+  local access_token=$(jq -r '.openai.access // empty' "$auth_file" 2>/dev/null)
+  local account_id=$(jq -r '.openai.accountId // empty' "$auth_file" 2>/dev/null)
+
+  [[ -z "$access_token" || -z "$account_id" ]] && return
+
+  local init_request=$(jq -cn '{jsonrpc:"2.0",id:1,method:"initialize",params:{clientInfo:{name:"ai-switch",version:"1.0.0"},capabilities:{experimentalApi:true}}}')
+  local login_request=$(jq -cn \
+    --arg accessToken "$access_token" \
+    --arg chatgptAccountId "$account_id" \
+    '{jsonrpc:"2.0",id:2,method:"account/login/start",params:{type:"chatgptAuthTokens",accessToken:$accessToken,chatgptAccountId:$chatgptAccountId,chatgptPlanType:null}}')
+  local account_request=$(jq -cn '{jsonrpc:"2.0",id:3,method:"account/read",params:{refreshToken:false}}')
+
+  local response=$({
+    printf '%s\n' "$init_request"
+    sleep 1
+    printf '%s\n' "$login_request"
+    sleep 1
+    printf '%s\n' "$account_request"
+    sleep 2
+  } | CODEX_HOME="$codex_home" codex app-server 2>/dev/null)
+
+  local email=$(printf '%s\n' "$response" | jq -r 'select(.id == 3) | .result.account.email // empty' 2>/dev/null)
+  [[ -n "$email" && "$email" != "null" ]] && printf '%s\n' "$email"
+}
+
+get_display_name() {
+  local acc=$1
+  if [[ -n "${ACCOUNT_NAMES[$acc]}" ]]; then
+    echo "${ACCOUNT_NAMES[$acc]}"
+    return
+  fi
+  local email=$(get_email "$acc")
+  [[ -n "$email" ]] && echo "${email%%@*}"
+}
+
+get_email() {
+  local acc=$1
+  local auth_file="$(get_account_auth_file "$acc")"
+  local codex_home="$(get_account_data_dir "$acc")"
+  
+  # Try JWT id_token first
+  local id_token=$(jq -r '.tokens.id_token // empty' "$auth_file" 2>/dev/null)
+  if [[ -n "$id_token" && "$id_token" != "null" ]]; then
+    local jwt_payload=$(echo "$id_token" | cut -d'.' -f2 | base64 -d 2>/dev/null)
+    local acc_email=$(echo "$jwt_payload" | jq -r '.email // empty' 2>/dev/null)
+    if [[ -n "$acc_email" && "$acc_email" != "null" ]]; then
+      echo "$acc_email"
+      return
+    fi
+  fi
+
+  get_opencode_account_email "$codex_home"
+}
+
+is_logged_in() {
+  local acc=$1
+  local auth_file="$(get_account_auth_file "$acc")"
+  [[ -f "$auth_file" ]] && [[ -s "$auth_file" ]]
+}
+
+get_account_id() {
+  local auth_file="$1"
+  if [[ -f "$auth_file" ]]; then
+    # Try OpenAI first
+    local openai_id=$(jq -r '.openai.accountId // .tokens.accountId // empty' "$auth_file" 2>/dev/null)
+    if [[ -n "$openai_id" && "$openai_id" != "null" ]]; then
+      echo "openai:$openai_id"
+      return
+    fi
+    # Try GitHub Copilot
+    local copilot_token=$(jq -r '.["github-copilot"].access // empty' "$auth_file" 2>/dev/null)
+    if [[ -n "$copilot_token" && "$copilot_token" != "null" ]]; then
+      echo "copilot:${copilot_token:0:16}"
+      return
+    fi
+  fi
+}
+
+get_provider_from_auth() {
+  local auth_file="$1"
+  if [[ -f "$auth_file" ]]; then
+    if jq -e '.openai.accountId != null' "$auth_file" >/dev/null 2>&1; then
+      echo "openai"
+    elif jq -e '.["github-copilot"].access != null' "$auth_file" >/dev/null 2>&1; then
+      echo "copilot"
+    fi
+  fi
+}
+
+get_plan_type_from_auth() {
+  local auth_file="$1"
+  if [[ -f "$auth_file" ]]; then
+    local provider=$(get_provider_from_auth "$auth_file")
+    if [[ "$provider" == "copilot" ]]; then
+      echo "copilot"
+      return
+    fi
+    
+    # OpenAI: Decode JWT to get plan type
+    local access_token=$(jq -r '.openai.access // .tokens.access_token // empty' "$auth_file" 2>/dev/null)
+    if [[ -n "$access_token" && "$access_token" != "null" ]]; then
+      local jwt_payload=$(echo "$access_token" | cut -d'.' -f2 | base64 -d 2>/dev/null)
+      local plan=$(echo "$jwt_payload" | jq -r '.["https://api.openai.com/auth"].chatgpt_plan_type // empty' 2>/dev/null)
+      if [[ "$plan" == "plus" || "$plan" == "pro" ]]; then
+        echo "plus"
+      else
+        echo "free"
+      fi
+    fi
+  fi
+}
+
+account_id_exists() {
+  local target_id="$1"
+  for acc in "${ACCOUNTS[@]}"; do
+    local auth_file="$(get_account_auth_file "$acc")"
+    local acc_id=$(get_account_id "$auth_file")
+    if [[ "$acc_id" == "$target_id" ]]; then
+      echo "$acc"
+      return 0
+    fi
+  done
+  return 1
+}
+
+get_db_size() {
+  local acc=$1
+  local db_file="$(get_account_data_dir "$acc")/opencode.db"
+  if [[ -f "$db_file" ]]; then
+    local size=$(stat -f%z "$db_file" 2>/dev/null || echo 0)
+    if (( size > 1048576 )); then
+      echo "$((size / 1048576))MB"
+    else
+      echo "$((size / 1024))KB"
+    fi
+  else
+    echo "-"
+  fi
+}
+
+get_type_color() {
+  case "$1" in
+    plus) echo "$YELLOW" ;;
+    api)  echo "$MAGENTA" ;;
+    copilot) echo "$BLUE" ;;
+    *)    echo "$CYAN" ;;
+  esac
+}
+
+# =============================================================================
+# Account Auto-Detection
+# =============================================================================
+
+auto_add_new_account() {
+  local current_acc="$1"
+  local auth_file="$2"
+  local old_account_id="$3"
+  
+  local new_account_id=$(get_account_id "$auth_file")
+  
+  [[ -z "$new_account_id" || "$new_account_id" == "$old_account_id" ]] && return 0
+  
+  local existing_acc=$(account_id_exists "$new_account_id")
+  if [[ -n "$existing_acc" ]]; then
+    echo -e "${YELLOW}Account already exists:${NC} ${existing_acc}"
+    return 0
+  fi
+  
+  local plan_type=$(get_plan_type_from_auth "$auth_file")
+  
+  echo ""
+  echo -e "${CYAN}Detected new account via /connect!${NC}"
+  
+  local email=$(get_opencode_account_email "$(dirname "$auth_file")")
+  local display_name="${email%%@*}"
+  
+  local next_num=$(get_next_account_number "$plan_type")
+  local shortcut name
+  if [[ "$plan_type" == "plus" ]]; then
+    shortcut="p${next_num}"
+    name="plus${next_num}"
+  elif [[ "$plan_type" == "copilot" ]]; then
+    shortcut="c${next_num}"
+    name="copilot${next_num}"
+  else
+    shortcut="f${next_num}"
+    name="free${next_num}"
+  fi
+  
+  local new_data_dir="$(get_account_data_dir "$name")"
+  mkdir -p "$new_data_dir"
+  cp "$auth_file" "$new_data_dir/auth.json"
+  setup_shared_symlinks "$new_data_dir"
+  
+  echo "${name}:${plan_type}:${shortcut}:${display_name}" >> "$ACCOUNTS_CONF"
+  
+  echo -e "${GREEN}Auto-added:${NC} ${BOLD}${display_name}${NC} (${plan_type}) -> ${BOLD}${shortcut}${NC}"
+  echo ""
+  echo -e "Add alias to ~/.zshrc:  ${BOLD}alias ${shortcut}='ai ${shortcut}'${NC}"
+  
+  ACCOUNTS=()
+  load_accounts
+}
+
+auto_add_from_default() {
+  local old_account_id="$1"
+  local default_auth="$DATA_HOME_ROOT/opencode/auth.json"
+  
+  [[ ! -f "$default_auth" ]] && return 0
+  
+  local new_account_id=$(get_account_id "$default_auth")
+  [[ -z "$new_account_id" || "$new_account_id" == "$old_account_id" ]] && return 0
+  
+  local existing_acc=$(account_id_exists "$new_account_id")
+  if [[ -n "$existing_acc" ]]; then
+    echo -e "${YELLOW}Account already exists:${NC} ${existing_acc}"
+    return 0
+  fi
+  
+  local plan_type=$(get_plan_type_from_auth "$default_auth")
+  
+  echo ""
+  echo -e "${CYAN}Detected new account via /connect!${NC}"
+  
+  local email=$(get_opencode_account_email "$DATA_HOME_ROOT/opencode")
+  local display_name="${email%%@*}"
+  
+  local next_num=$(get_next_account_number "$plan_type")
+  local shortcut name
+  if [[ "$plan_type" == "plus" ]]; then
+    shortcut="p${next_num}"
+    name="plus${next_num}"
+  elif [[ "$plan_type" == "copilot" ]]; then
+    shortcut="c${next_num}"
+    name="copilot${next_num}"
+  else
+    shortcut="f${next_num}"
+    name="free${next_num}"
+  fi
+  
+  local new_data_dir="$(get_account_data_dir "$name")"
+  mkdir -p "$new_data_dir"
+  cp "$default_auth" "$new_data_dir/auth.json"
+  setup_shared_symlinks "$new_data_dir"
+  
+  echo "${name}:${plan_type}:${shortcut}:${display_name}" >> "$ACCOUNTS_CONF"
+  
+  echo -e "${GREEN}Auto-added:${NC} ${BOLD}${display_name}${NC} (${plan_type}) -> ${BOLD}${shortcut}${NC}"
+  echo ""
+  echo -e "Add alias to ~/.zshrc:  ${BOLD}alias ${shortcut}='ai ${shortcut}'${NC}"
+  
+  ACCOUNTS=()
+  load_accounts
+}
+
+# =============================================================================
+# Setup & Symlinks
+# =============================================================================
+
+update_display_name() {
+  local acc=$1
+  local display_name=$2
+  local tmp=$(mktemp)
+  while IFS=: read -r name t s d || [[ -n "$name" ]]; do
+    if [[ "$name" == "$acc" ]]; then
+      echo "${name}:${t}:${s}:${display_name}"
+    else
+      if [[ -n "$d" ]]; then
+        echo "${name}:${t}:${s}:${d}"
+      elif [[ -n "$name" && ! "$name" =~ ^#.*$ ]]; then
+        echo "${name}:${t}:${s}"
+      else
+        echo "$name"
+      fi
+    fi
+  done < "$ACCOUNTS_CONF" > "$tmp"
+  mv "$tmp" "$ACCOUNTS_CONF"
+}
+
+setup_shared_symlinks() {
+  local data_dir="$1"
+  local default_data="$DATA_HOME_ROOT/opencode"
+  
+  # Files to symlink (session database)
+  local shared_files=(
+    "opencode.db"
+    "opencode.db-shm"
+    "opencode.db-wal"
+  )
+  
+  # Directories to symlink
+  local shared_dirs=(
+    "log"
+    "tool-output"
+    "storage"
+    "plugins"
+    "snapshot"
+    "backup"
+    "bin"
+    "worktree"
+  )
+  
+  for f in "${shared_files[@]}"; do
+    local target="$default_data/$f"
+    local link="$data_dir/$f"
+    [[ -e "$link" && ! -L "$link" ]] && rm -f "$link"
+    [[ -e "$target" && ! -L "$link" ]] && ln -sf "$target" "$link"
+  done
+  
+  for d in "${shared_dirs[@]}"; do
+    local target="$default_data/$d"
+    local link="$data_dir/$d"
+    [[ -d "$link" && ! -L "$link" ]] && rm -rf "$link"
+    [[ -d "$target" && ! -L "$link" ]] && ln -sf "$target" "$link"
+  done
+}
+
+setup_accounts() {
+  echo -e "${BOLD}Setting up account directories...${NC}"
+  
+  local default_data="$DATA_HOME_ROOT/opencode"
+  if [[ ! -d "$default_data" ]]; then
+    echo -e "${YELLOW}Warning: Default opencode data not found at $default_data${NC}"
+    echo "Run opencode once first to initialize it."
+  fi
+  
+  for acc in "${ACCOUNTS[@]}"; do
+    local data_dir="$(get_account_data_dir "$acc")"
+    
+    if [[ ! -d "$data_dir" ]]; then
+      mkdir -p "$data_dir"
+      echo -e "  ${GREEN}+${NC} Created data dir: $acc"
+    fi
+    
+    setup_shared_symlinks "$data_dir"
+    echo -e "  ${GREEN}↔${NC} Symlinks updated: $acc"
+  done
+  
+  echo -e "\n${GREEN}Done!${NC} Run 'ai' to see status."
+  echo -e "${DIM}Accounts share sessions/plugins via symlinks, auth is isolated.${NC}"
+}
+
+# =============================================================================
+# Commands
+# =============================================================================
+
+show_status() {
+  echo ""
+  echo -e "${BOLD}AI Multi-Account Status${NC}"
+  echo "========================"
+
+  local type
+  for type in free plus copilot api; do
+    local printed_header=""
+
+    for acc in "${ACCOUNTS[@]}"; do
+      [[ "${ACCOUNT_TYPES[$acc]}" != "$type" ]] && continue
+
+      local shortcut="${ACCOUNT_SHORTCUTS[$acc]}"
+      local display_name="${ACCOUNT_NAMES[$acc]}"
+      local usage=$(get_db_size "$acc")
+      local limit_summary=""
+      if [[ "$type" == "free" || "$type" == "plus" ]]; then
+        limit_summary=$(get_cached_limit_summary "$acc")
+      fi
+      local type_color=$(get_type_color "$type")
+
+      if [[ -z "$printed_header" ]]; then
+        echo ""
+        local type_upper=$(echo "$type" | tr '[:lower:]' '[:upper:]')
+        echo -e "${type_color}${type_upper} Accounts:${NC}"
+        printed_header=1
+      fi
+
+      if [[ -n "$display_name" ]]; then
+        if is_logged_in "$acc"; then
+          echo -e "  ${GREEN}●${NC} ${BOLD}${shortcut}${NC}  ${display_name}  ${DIM}${usage}${NC}${limit_summary:+  ${DIM}${limit_summary}${NC}}"
+        else
+          echo -e "  ${RED}○${NC} ${shortcut}  ${display_name}  ${DIM}${usage}${NC}${limit_summary:+  ${DIM}${limit_summary}${NC}}"
+        fi
+      else
+        if is_logged_in "$acc"; then
+          echo -e "  ${GREEN}●${NC} ${BOLD}${shortcut}${NC}  ${DIM}(no name)${NC}  ${DIM}${usage}${NC}${limit_summary:+  ${DIM}${limit_summary}${NC}}"
+        else
+          echo -e "  ${RED}○${NC} ${shortcut}  ${DIM}(not logged in)${NC}  ${DIM}${usage}${NC}${limit_summary:+  ${DIM}${limit_summary}${NC}}"
+        fi
+      fi
+    done
+  done
+  
+  echo ""
+  echo -e "${BOLD}Commands:${NC}"
+  echo "  ai                  Show this status"
+  echo "  ai <shortcut>       Launch account (e.g., ai f1)"
+  echo "  ai usage <shortcut> Show plan & usage info"
+  echo "  ai add [TYPE]       Add account (free/plus/copilot/api)"
+  echo "  ai rm <shortcut>    Remove account"
+  echo ""
+}
+
+get_next_account_number() {
+  local type="$1"
+  local prefix
+  case "$type" in
+    plus) prefix="p" ;;
+    api) prefix="a" ;;
+    copilot) prefix="c" ;;
+    *) prefix="f" ;;
+  esac
+
+  local max_num=0
+  for acc in "${ACCOUNTS[@]}"; do
+    [[ "${ACCOUNT_TYPES[$acc]}" != "$type" ]] && continue
+
+    local name_suffix="${acc#$type}"
+    if [[ "$name_suffix" != "$acc" && -n "$name_suffix" && "$name_suffix" = <-> && "$name_suffix" -gt "$max_num" ]]; then
+      max_num=$name_suffix
+    fi
+
+    local shortcut="${ACCOUNT_SHORTCUTS[$acc]}"
+    local shortcut_suffix="${shortcut#$prefix}"
+    if [[ "$shortcut_suffix" != "$shortcut" && -n "$shortcut_suffix" && "$shortcut_suffix" = <-> && "$shortcut_suffix" -gt "$max_num" ]]; then
+      max_num=$shortcut_suffix
+    fi
+  done
+
+  echo $((max_num + 1))
+}
+
+add_account() {
+  local type=${1:-free}
+  local shortcut name
+  
+  if [[ "$type" == "plus" ]]; then
+    local next_num=$(get_next_account_number "plus")
+    shortcut="p${next_num}"
+    name="plus${next_num}"
+  elif [[ "$type" == "api" ]]; then
+    local next_num=$(get_next_account_number "api")
+    shortcut="a${next_num}"
+    name="api${next_num}"
+  elif [[ "$type" == "copilot" ]]; then
+    local next_num=$(get_next_account_number "copilot")
+    shortcut="c${next_num}"
+    name="copilot${next_num}"
+  else
+    type="free"
+    local next_num=$(get_next_account_number "free")
+    shortcut="f${next_num}"
+    name="free${next_num}"
+  fi
+  
+  echo "${name}:${type}:${shortcut}:" >> "$ACCOUNTS_CONF"
+  echo -e "${GREEN}Added:${NC} ${name} (${type}) -> ${BOLD}${shortcut}${NC}"
+  
+  local data_dir="$(get_account_data_dir "$name")"
+  mkdir -p "$data_dir"
+  setup_shared_symlinks "$data_dir"
+  
+  echo -e "${GREEN}Created data directory with shared symlinks${NC}"
+  echo ""
+  echo -e "Add to ~/.zshrc:  ${BOLD}alias ${shortcut}='ai ${shortcut}'${NC}"
+  echo -e "Then run:         ${BOLD}${shortcut}${NC}"
+  echo ""
+  echo -e "${DIM}After login, name will auto-update to your email${NC}"
+}
+
+remove_account() {
+  local input=$1
+  
+  if [[ -z "$input" ]]; then
+    echo -e "${RED}Usage: ai rm <shortcut>${NC}"
+    echo "Example: ai rm f3"
+    return 1
+  fi
+  
+  local acc
+  if [[ -n "${SHORTCUT_TO_ACCOUNT[$input]}" ]]; then
+    acc="${SHORTCUT_TO_ACCOUNT[$input]}"
+  elif [[ " ${ACCOUNTS[@]} " =~ " ${input} " ]]; then
+    acc="$input"
+  else
+    echo -e "${RED}Unknown account: $input${NC}"
+    return 1
+  fi
+  
+  local shortcut="${ACCOUNT_SHORTCUTS[$acc]}"
+  local display_name=$(get_display_name "$acc")
+  
+  echo -e "${YELLOW}Remove account:${NC} ${acc} (${shortcut}) - ${display_name}"
+  echo -n "Delete data too? [y/N]: "
+  read -r delete_data
+  
+  local tmp=$(mktemp)
+  grep -v "^${acc}:" "$ACCOUNTS_CONF" > "$tmp"
+  mv "$tmp" "$ACCOUNTS_CONF"
+  echo -e "${GREEN}Removed from config${NC}"
+  
+  if [[ "$delete_data" =~ ^[Yy]$ ]]; then
+    rm -rf "$(get_account_config_home "$acc")"
+    rm -rf "$(get_account_data_home "$acc")"
+    rm -rf "$(get_account_state_home "$acc")"
+    echo -e "${GREEN}Deleted directories${NC}"
+  else
+    echo -e "${DIM}Data kept in:${NC}"
+    echo "  $(get_account_data_home "$acc")"
+  fi
+  
+  echo ""
+  echo -e "Remove alias from ~/.zshrc:  ${BOLD}alias ${shortcut}=...${NC}"
+}
+
+rename_account() {
+  local input=$1
+  local new_name=$2
+  
+  if [[ -z "$input" || -z "$new_name" ]]; then
+    echo -e "${RED}Usage: ai rename <shortcut> <new_name>${NC}"
+    echo "Example: ai rename f1 work-account"
+    return 1
+  fi
+  
+  local acc
+  if [[ -n "${SHORTCUT_TO_ACCOUNT[$input]}" ]]; then
+    acc="${SHORTCUT_TO_ACCOUNT[$input]}"
+  else
+    echo -e "${RED}Unknown account: $input${NC}"
+    return 1
+  fi
+  
+  update_display_name "$acc" "$new_name"
+  echo -e "${GREEN}Renamed:${NC} ${input} -> ${new_name}"
+}
+
+show_usage() {
+  local input=$1
+  
+  if [[ -z "$input" ]]; then
+    echo -e "${RED}Usage: ai usage <shortcut>${NC}"
+    echo "Example: ai usage f1"
+    return 1
+  fi
+  
+  local acc
+  if [[ -n "${SHORTCUT_TO_ACCOUNT[$input]}" ]]; then
+    acc="${SHORTCUT_TO_ACCOUNT[$input]}"
+  elif [[ " ${ACCOUNTS[@]} " =~ " ${input} " ]]; then
+    acc="$input"
+  else
+    echo -e "${RED}Unknown account: $input${NC}"
+    return 1
+  fi
+  
+  local type="${ACCOUNT_TYPES[$acc]}"
+  local type_color=$(get_type_color "$type")
+  local display_name=$(get_display_name "$acc")
+  
+  local data_home="$(get_account_data_home "$acc")"
+  local codex_home="$(get_account_data_dir "$acc")"
+  local auth_file="$(get_account_auth_file "$acc")"
+  
+  if [[ ! -d "$data_home" ]]; then
+    echo -e "${RED}Account not set up: $acc${NC}"
+    echo "Run 'ai setup' first"
+    return 1
+  fi
+  
+  if [[ ! -f "$auth_file" ]]; then
+    echo -e "${RED}Not logged in: $acc${NC}"
+    echo "Launch account first: ai $input"
+    return 1
+  fi
+  
+  echo ""
+  echo -e "${BOLD}Account: ${display_name:-$acc}${NC} ${type_color}(${type})${NC}"
+  echo "================================"
+  
+  local email=$(get_email "$acc")
+  if [[ -n "$email" ]]; then
+    local current_display="${ACCOUNT_NAMES[$acc]}"
+    [[ -z "$current_display" ]] && update_display_name "$acc" "${email%%@*}"
+    echo -e "Email: ${email}"
+  fi
+  
+  if [[ "$type" == "free" || "$type" == "plus" ]]; then
+    if display_rate_limits "$codex_home" "$acc"; then
+      echo ""
+      echo -e "${DIM}Data from Codex app-server${NC}"
+    else
+      echo -e "${YELLOW}Could not fetch rate limits${NC}"
+      echo "Account may not be logged in"
+    fi
+  elif [[ "$type" == "copilot" ]]; then
+    echo ""
+    echo -e "${DIM}GitHub Copilot account (no rate limit API)${NC}"
+  fi
+  
+  local db_size=$(get_db_size "$acc")
+  echo -e "Local data: ${db_size}"
+  echo ""
+}
+
+launch() {
+  local input=$1
+  shift
+  
+  local acc
+  if [[ -n "${SHORTCUT_TO_ACCOUNT[$input]}" ]]; then
+    acc="${SHORTCUT_TO_ACCOUNT[$input]}"
+  elif [[ " ${ACCOUNTS[@]} " =~ " ${input} " ]]; then
+    acc="$input"
+  else
+    echo -e "${RED}Unknown account: $input${NC}"
+    echo "Run 'ai' to see available accounts"
+    return 1
+  fi
+  
+  local data_home="$(get_account_data_home "$acc")"
+  local data_dir="$(get_account_data_dir "$acc")"
+  local type="${ACCOUNT_TYPES[$acc]}"
+  local type_color=$(get_type_color "$type")
+  local display_name=$(get_display_name "$acc")
+  
+  if [[ ! -d "$data_dir" ]]; then
+    echo -e "${RED}Data dir not found. Run: ai setup${NC}"
+    return 1
+  fi
+  
+  setup_shared_symlinks "$data_dir"
+  
+  init_usage
+  record_account_usage_timestamp "$acc"
+  
+  if [[ -n "$display_name" ]]; then
+    echo -e "${GREEN}Launching${NC} ${BOLD}${display_name}${NC} ${type_color}(${type})${NC}"
+  else
+    echo -e "${GREEN}Launching${NC} ${BOLD}${acc}${NC} ${type_color}(${type})${NC}"
+  fi
+  
+  local auth_file="$data_dir/auth.json"
+  local old_account_id=$(get_account_id "$auth_file")
+  
+  # Launch with isolated data home for auth, shared config/state
+  XDG_DATA_HOME="$data_home" \
+  opencode "$@"
+
+  # Refresh rate limits cache (OpenAI only)
+  if [[ "$type" == "free" || "$type" == "plus" ]]; then
+    refresh_rate_limits_cache "$acc" "$data_dir" >/dev/null 2>&1 || true
+  fi
+  
+  # Check for new account via /connect
+  auto_add_new_account "$acc" "$auth_file" "$old_account_id"
+  
+  # Auto-update display name from email
+  local current_display="${ACCOUNT_NAMES[$acc]}"
+  if [[ -z "$current_display" ]]; then
+    local email=$(get_email "$acc")
+    if [[ -n "$email" ]]; then
+      local email_prefix="${email%%@*}"
+      update_display_name "$acc" "$email_prefix"
+      echo -e "${DIM}Updated name: ${email_prefix}${NC}"
+    fi
+  fi
+}
+
+# =============================================================================
+# Main
+# =============================================================================
+
+load_accounts
+init_usage
+
+case "$1" in
+  ""|status|list|ls)
+    show_status
+    ;;
+  setup)
+    setup_accounts
+    ;;
+  add)
+    add_account "$2"
+    ;;
+  rm|remove|del|delete)
+    remove_account "$2"
+    ;;
+  rename|name)
+    rename_account "$2" "$3"
+    ;;
+  usage|u)
+    show_usage "$2"
+    ;;
+  help|-h|--help)
+    echo "ai-switch: Multi-account manager for OpenCode/Codex"
+    echo ""
+    echo "Usage: ai [command]"
+    echo ""
+    echo "Commands:"
+    echo "  ai                  Show status of all accounts"
+    echo "  ai <shortcut>       Launch account (e.g., f1, p1, c1)"
+    echo "  ai usage <shortcut> Show account usage/plan info"
+    echo "  ai add [TYPE]       Add account (free/plus/copilot/api)"
+    echo "  ai rm <shortcut>    Remove account"
+    echo "  ai rename <s> <n>   Set display name"
+    echo "  ai setup            Create directories"
+    echo ""
+    echo "Config: $ACCOUNTS_CONF"
+    ;;
+  __auto_add_default)
+    auto_add_from_default "$2"
+    ;;
+  *)
+    launch "$@"
+    ;;
+esac

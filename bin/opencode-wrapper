@@ -1,0 +1,56 @@
+#!/bin/zsh
+# OpenCode wrapper - auto-detects new accounts on /connect
+# Part of ai-switch: https://github.com/yizhen0322/ai-switch
+#
+# This wrapper intercepts opencode calls to detect when users
+# authenticate with new accounts via /connect command.
+
+REAL_OPENCODE="$HOME/.opencode/bin/opencode"
+AI_SWITCH="$HOME/.local/bin/ai-switch"
+DEFAULT_AUTH="$HOME/.local/share/opencode/auth.json"
+
+# Extract account ID from auth.json for change detection
+get_account_id_from_file() {
+  local auth_file="$1"
+  [[ ! -f "$auth_file" ]] && return
+  
+  # Try OpenAI format (.openai.accessToken)
+  local token=$(jq -r '.openai.accessToken // empty' "$auth_file" 2>/dev/null)
+  if [[ -n "$token" ]]; then
+    local payload=$(echo "$token" | cut -d'.' -f2 | base64 -d 2>/dev/null)
+    local account_id=$(echo "$payload" | jq -r '.https://api\\.openai\\.com/profile.account_id // empty' 2>/dev/null)
+    if [[ -n "$account_id" ]]; then
+      echo "openai:$account_id"
+      return
+    fi
+  fi
+  
+  # Try GitHub Copilot format (.copilot.accessToken)
+  local copilot_token=$(jq -r '.copilot.accessToken // empty' "$auth_file" 2>/dev/null)
+  if [[ -n "$copilot_token" ]]; then
+    echo "copilot:${copilot_token:0:16}"
+    return
+  fi
+}
+
+# Record current account ID before launch
+old_account_id=""
+if [[ -f "$DEFAULT_AUTH" ]]; then
+  old_account_id=$(get_account_id_from_file "$DEFAULT_AUTH")
+fi
+
+# Run the real opencode
+"$REAL_OPENCODE" "$@"
+exit_code=$?
+
+# After exit, check if a new account was added via /connect
+if [[ -f "$DEFAULT_AUTH" ]]; then
+  new_account_id=$(get_account_id_from_file "$DEFAULT_AUTH")
+  
+  if [[ -n "$new_account_id" && "$new_account_id" != "$old_account_id" ]]; then
+    # Delegate to ai-switch for auto-add logic
+    "$AI_SWITCH" __auto_add_default "$old_account_id" 2>/dev/null || true
+  fi
+fi
+
+exit $exit_code
