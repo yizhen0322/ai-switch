@@ -93,6 +93,7 @@ Commands:
   ai                  Show this status
   ai <shortcut>       Launch account (e.g., ai f1)
   ai usage <shortcut> Show plan & usage info
+  ai renew usage      Refresh usage data for all supported accounts
   ai add [TYPE]       Add account (free/plus/copilot/api)
   ai rm <shortcut>    Remove account
 ```
@@ -131,6 +132,12 @@ ai f2           # Launch and login
 
 ```bash
 ai usage f1
+```
+
+Refresh all supported usage data:
+
+```bash
+ai renew usage
 ```
 
 Output:
