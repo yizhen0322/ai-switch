@@ -608,7 +608,7 @@ get_opencode_account_email() {
   fi
 }
 
-# Get display name (email prefix or custom name)
+# Get display name (full email or custom name)
 get_display_name() {
   local acc=$1
   
@@ -621,11 +621,40 @@ get_display_name() {
   # Otherwise try to get from email
   local email=$(get_email "$acc")
   if [[ -n "$email" ]]; then
-    # Extract prefix before @
-    echo "${email%%@*}"
+    echo "$email"
   else
     echo ""
   fi
+}
+
+get_resolved_display_name() {
+  local acc="$1"
+  local type="${ACCOUNT_TYPES[$acc]}"
+
+  case "$type" in
+    free|plus|api)
+      get_email "$acc"
+      ;;
+    copilot)
+      get_copilot_login "$(get_account_auth_file "$acc")"
+      ;;
+  esac
+}
+
+sync_display_name() {
+  local acc="$1"
+  local current_display="${ACCOUNT_NAMES[$acc]}"
+  local resolved_display="$(get_resolved_display_name "$acc")"
+
+  [[ -z "$resolved_display" ]] && return 1
+
+  if [[ -z "$current_display" || "$current_display" == "${resolved_display%%@*}" ]]; then
+    if [[ "$current_display" != "$resolved_display" ]]; then
+      update_display_name "$acc" "$resolved_display"
+    fi
+  fi
+
+  printf '%s\n' "${ACCOUNT_NAMES[$acc]:-$resolved_display}"
 }
 
 # Get email from account's auth.json
@@ -817,8 +846,7 @@ import_provider_account() {
 
   local display_name=""
   if [[ "$provider" == "openai" ]]; then
-    local email=$(get_opencode_account_email "$source_home")
-    display_name="${email%%@*}"
+    display_name=$(get_opencode_account_email "$source_home")
   elif [[ "$provider" == "copilot" ]]; then
     display_name=$(get_copilot_login "$auth_file")
   fi
@@ -990,6 +1018,7 @@ renew_usage() {
         prepare_codex_launcher_home "$acc"
 
         if refresh_rate_limits_cache "$acc" "$app_server_home" "$codex_home" "$type"; then
+          sync_display_name "$acc" >/dev/null 2>&1 || true
           echo -e "  ${GREEN}✓${NC} ${shortcut} refreshed (${LAST_USAGE_SOURCE})"
           refreshed=$((refreshed + 1))
         else
@@ -1010,15 +1039,10 @@ renew_usage() {
           continue
         fi
 
-        local login=$(get_copilot_login "$auth_file")
-        if [[ -z "$login" ]]; then
+        if ! sync_display_name "$acc" >/dev/null 2>&1; then
           echo -e "  ${RED}✗${NC} ${shortcut} refresh failed"
           failed=$((failed + 1))
           continue
-        fi
-
-        if [[ -z "${ACCOUNT_NAMES[$acc]}" ]]; then
-          update_display_name "$acc" "$login"
         fi
 
         echo -e "  ${GREEN}✓${NC} ${shortcut} refreshed (GitHub Copilot private usage API)"
@@ -1033,6 +1057,7 @@ renew_usage() {
 
   echo ""
   echo -e "${BOLD}Summary:${NC} ${GREEN}${refreshed} refreshed${NC}, ${RED}${failed} failed${NC}, ${YELLOW}${skipped} skipped${NC}"
+  show_status
 }
 
 renew_command() {
@@ -1218,7 +1243,6 @@ show_status() {
 
       local shortcut="${ACCOUNT_SHORTCUTS[$acc]}"
       local display_name="${ACCOUNT_NAMES[$acc]}"
-      local usage=$(get_db_size "$acc")
       local limit_summary=""
       # Only show rate limits for OpenAI accounts (free/plus)
       if [[ "$type" == "free" || "$type" == "plus" ]]; then
@@ -1237,15 +1261,15 @@ show_status() {
 
       if [[ -n "$display_name" ]]; then
         if is_logged_in "$acc"; then
-          echo -e "  ${GREEN}●${NC} ${BOLD}${shortcut}${NC}  ${display_name}  ${DIM}${usage}${NC}${limit_summary:+  ${DIM}${limit_summary}${NC}}"
+          echo -e "  ${GREEN}●${NC} ${BOLD}${shortcut}${NC}  ${display_name}${limit_summary:+  ${DIM}${limit_summary}${NC}}"
         else
-          echo -e "  ${RED}○${NC} ${shortcut}  ${display_name}  ${DIM}${usage}${NC}${limit_summary:+  ${DIM}${limit_summary}${NC}}"
+          echo -e "  ${RED}○${NC} ${shortcut}  ${display_name}${limit_summary:+  ${DIM}${limit_summary}${NC}}"
         fi
       else
         if is_logged_in "$acc"; then
-          echo -e "  ${GREEN}●${NC} ${BOLD}${shortcut}${NC}  ${DIM}(no name)${NC}  ${DIM}${usage}${NC}${limit_summary:+  ${DIM}${limit_summary}${NC}}"
+          echo -e "  ${GREEN}●${NC} ${BOLD}${shortcut}${NC}  ${DIM}(no name)${NC}${limit_summary:+  ${DIM}${limit_summary}${NC}}"
         else
-          echo -e "  ${RED}○${NC} ${shortcut}  ${DIM}(not logged in)${NC}  ${DIM}${usage}${NC}${limit_summary:+  ${DIM}${limit_summary}${NC}}"
+          echo -e "  ${RED}○${NC} ${shortcut}  ${DIM}(not logged in)${NC}${limit_summary:+  ${DIM}${limit_summary}${NC}}"
         fi
       fi
     done
@@ -1363,7 +1387,7 @@ remove_account() {
   fi
   
   local shortcut="${ACCOUNT_SHORTCUTS[$acc]}"
-  local display_name=$(get_display_name "$acc")
+  local display_name=$(sync_display_name "$acc" 2>/dev/null || get_display_name "$acc")
   
   echo -e "${YELLOW}Remove account:${NC} ${acc} (${shortcut}) - ${display_name}"
   echo -n "Delete data too? [y/N]: "
@@ -1469,8 +1493,8 @@ show_usage() {
   local email=$(get_email "$acc")
   if [[ -n "$email" ]]; then
     local current_display="${ACCOUNT_NAMES[$acc]}"
-    if [[ -z "$current_display" ]]; then
-      update_display_name "$acc" "${email%%@*}"
+    if [[ -z "$current_display" || "$current_display" == "${email%%@*}" ]]; then
+      update_display_name "$acc" "$email"
     fi
     echo -e "Email: ${email}"
   fi
@@ -1503,10 +1527,6 @@ show_usage() {
     fi
   fi
   
-  # Show local stats
-  local db_size=$(get_db_size "$acc")
-  echo -e "Local data: ${db_size}"
-  
   echo ""
 }
 
@@ -1532,7 +1552,7 @@ launch() {
   local codex_home="$(get_account_codex_home "$acc")"
   local type="${ACCOUNT_TYPES[$acc]}"
   local type_color=$(get_type_color "$type")
-  local display_name=$(get_display_name "$acc")
+  local display_name=$(sync_display_name "$acc" 2>/dev/null || get_display_name "$acc")
   
   # Check if data directory exists
   if [[ ! -d "$data_dir" ]]; then
@@ -1573,14 +1593,9 @@ launch() {
   auto_add_new_account "$acc" "$auth_file" "$old_account_id"
   
   # After exit, check if we should update display name
-  local current_display="${ACCOUNT_NAMES[$acc]}"
-  if [[ -z "$current_display" ]]; then
-    local email=$(get_email "$acc")
-    if [[ -n "$email" ]]; then
-      local email_prefix="${email%%@*}"
-      update_display_name "$acc" "$email_prefix"
-      echo -e "${DIM}Updated name: ${email_prefix}${NC}"
-    fi
+  local updated_display_name=$(sync_display_name "$acc" 2>/dev/null || true)
+  if [[ -n "$updated_display_name" && "$updated_display_name" != "$display_name" ]]; then
+    echo -e "${DIM}Updated name: ${updated_display_name}${NC}"
   fi
 }
 
@@ -1608,7 +1623,7 @@ launch_codex() {
 
   local type="${ACCOUNT_TYPES[$acc]}"
   local type_color=$(get_type_color "$type")
-  local display_name=$(get_display_name "$acc")
+  local display_name=$(sync_display_name "$acc" 2>/dev/null || get_display_name "$acc")
   local codex_home="$(get_account_codex_home "$acc")"
   local app_server_home="$(get_account_data_dir "$acc")"
   local auth_file="$(get_account_auth_file "$acc")"
