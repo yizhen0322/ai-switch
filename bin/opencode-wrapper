@@ -8,23 +8,15 @@
 REAL_OPENCODE="$HOME/.opencode/bin/opencode"
 AI_SWITCH="$HOME/.local/bin/ai-switch"
 DEFAULT_AUTH="$HOME/.local/share/opencode/auth.json"
+AUTH_HELPER="${0:A:h}/ai-switch-auth"
+
+if [[ -f "$AUTH_HELPER" ]]; then
+  source "$AUTH_HELPER"
+fi
 
 # Extract account ID from auth.json for change detection
 get_account_id_from_file() {
-  local auth_file="$1"
-  [[ ! -f "$auth_file" ]] && return
-  
-  local account_id=$(jq -r '.openai.accountId // .tokens.accountId // .tokens.account_id // empty' "$auth_file" 2>/dev/null)
-  if [[ -n "$account_id" && "$account_id" != "null" ]]; then
-    echo "openai:$account_id"
-    return
-  fi
-  
-  local copilot_token=$(jq -r '.["github-copilot"].access // .copilot.accessToken // empty' "$auth_file" 2>/dev/null)
-  if [[ -n "$copilot_token" && "$copilot_token" != "null" ]]; then
-    echo "copilot:${copilot_token:0:16}"
-    return
-  fi
+  auth_account_id_from_file "$1"
 }
 
 # Record current account ID before launch

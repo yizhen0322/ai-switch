@@ -37,8 +37,9 @@ cd ai-switch
 ```bash
 mkdir -p ~/.local/bin
 cp bin/ai-switch ~/.local/bin/
+cp bin/ai-switch-auth ~/.local/bin/
 cp bin/opencode-wrapper ~/.local/bin/opencode
-chmod +x ~/.local/bin/ai-switch ~/.local/bin/opencode
+chmod +x ~/.local/bin/ai-switch ~/.local/bin/ai-switch-auth ~/.local/bin/opencode
 ```
 
 2. Add to your `~/.zshrc`:
@@ -98,6 +99,7 @@ Commands:
   ai codex <shortcut> Launch Codex with account
   ai usage <shortcut> Show plan & usage info
   ai renew usage      Refresh usage data for all supported accounts
+  ai doctor           Check dependencies and account setup
   ai add [TYPE]       Add account (free/plus/copilot/api)
   ai rm <shortcut>    Remove account
 ```
@@ -142,6 +144,12 @@ Refresh all supported usage data:
 
 ```bash
 ai renew usage
+```
+
+Check your local setup:
+
+```bash
+ai doctor
 ```
 
 Output:
@@ -238,7 +246,25 @@ Run `ai setup` to initialize directories.
 
 ### Rate limits not showing
 
-Ensure you're logged in to the account first. Rate limits are only available for ChatGPT accounts (not GitHub Copilot).
+Ensure you're logged in to the account first. ChatGPT free/plus limits come from Codex, while GitHub Copilot usage is fetched live from GitHub.
+
+### Setup looks wrong
+
+Run:
+
+```bash
+ai doctor
+```
+
+This checks dependencies, wrapper installation, config problems, missing auth files, and broken symlinks.
+
+## Testing
+
+Run the repo regression suite with:
+
+```bash
+./test.sh
+```
 
 ### Sessions not shared
 

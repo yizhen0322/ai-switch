@@ -10,6 +10,11 @@ STATE_HOME_ROOT="$HOME/.local/state"
 USAGE_FILE="$HOME/.local/share/ai-usage.json"
 ACCOUNTS_CONF="$HOME/.config/ai-accounts.conf"
 BASE_CONFIG="$HOME/.config/opencode"
+AUTH_HELPER="${0:A:h}/ai-switch-auth"
+
+if [[ -f "$AUTH_HELPER" ]]; then
+  source "$AUTH_HELPER"
+fi
 
 # Colors
 RED='\033[0;31m'
@@ -38,6 +43,7 @@ load_accounts() {
   while IFS=: read -r name type shortcut display_name; do
     # Skip comments and empty lines
     [[ "$name" =~ ^#.*$ || -z "$name" ]] && continue
+    [[ -z "$type" || -z "$shortcut" ]] && continue
     
     ACCOUNTS+=("$name")
     ACCOUNT_TYPES[$name]="$type"
@@ -81,15 +87,70 @@ get_account_codex_auth_file() {
 
 # Initialize usage file if not exists
 init_usage() {
-  if [[ ! -f "$USAGE_FILE" ]]; then
-    echo '{}' > "$USAGE_FILE"
+  ensure_json_file "$USAGE_FILE"
+}
+
+ensure_parent_dir() {
+  local file_path="$1"
+  mkdir -p "$(dirname "$file_path")"
+}
+
+ensure_json_file() {
+  local file_path="$1"
+
+  ensure_parent_dir "$file_path"
+  if [[ ! -f "$file_path" ]]; then
+    printf '{}\n' > "$file_path"
   fi
 }
 
-record_account_usage_timestamp() {
+get_lock_dir_for_file() {
+  local file_path="$1"
+  printf '%s.lock\n' "$file_path"
+}
+
+with_file_lock() {
+  local file_path="$1"
+  shift
+
+  local lock_dir="$(get_lock_dir_for_file "$file_path")"
+  local start_time=$(date +%s)
+
+  ensure_parent_dir "$file_path"
+
+  while ! mkdir "$lock_dir" 2>/dev/null; do
+    local lock_pid=""
+    if [[ -f "$lock_dir/pid" ]]; then
+      lock_pid=$(<"$lock_dir/pid")
+    fi
+
+    if [[ -n "$lock_pid" ]] && ! kill -0 "$lock_pid" 2>/dev/null; then
+      rm -rf "$lock_dir"
+      continue
+    fi
+
+    local now=$(date +%s)
+    if (( now - start_time >= 10 )); then
+      echo -e "${RED}Timed out waiting for lock: $file_path${NC}" >&2
+      return 1
+    fi
+
+    sleep 0.1
+  done
+
+  printf '%s\n' "$$" > "$lock_dir/pid"
+  "$@"
+  local lock_status=$?
+  rm -rf "$lock_dir"
+  return $lock_status
+}
+
+record_account_usage_timestamp_unlocked() {
   local acc="$1"
   local now=$(date +%s)
   local tmp=$(mktemp)
+
+  ensure_json_file "$USAGE_FILE"
 
   jq --arg acc "$acc" --argjson now "$now" '
     .[$acc] = (
@@ -102,11 +163,17 @@ record_account_usage_timestamp() {
   ' "$USAGE_FILE" > "$tmp" 2>/dev/null && mv "$tmp" "$USAGE_FILE"
 }
 
-cache_rate_limits() {
+record_account_usage_timestamp() {
+  with_file_lock "$USAGE_FILE" record_account_usage_timestamp_unlocked "$1"
+}
+
+cache_rate_limits_unlocked() {
   local acc="$1"
   local response="$2"
   local now=$(date +%s)
   local tmp=$(mktemp)
+
+  ensure_json_file "$USAGE_FILE"
 
   jq --arg acc "$acc" --argjson now "$now" --argjson rate "$response" '
     .[$acc] = (
@@ -117,6 +184,10 @@ cache_rate_limits() {
       end
     )
   ' "$USAGE_FILE" > "$tmp" 2>/dev/null && mv "$tmp" "$USAGE_FILE"
+}
+
+cache_rate_limits() {
+  with_file_lock "$USAGE_FILE" cache_rate_limits_unlocked "$1" "$2"
 }
 
 format_reset_time() {
@@ -690,49 +761,17 @@ get_account_id_for_provider() {
   local auth_file="$1"
   local provider="$2"
 
-  [[ ! -f "$auth_file" ]] && return
-
-  case "$provider" in
-    openai)
-      local openai_id=$(jq -r '.openai.accountId // .tokens.accountId // empty' "$auth_file" 2>/dev/null)
-      if [[ -n "$openai_id" && "$openai_id" != "null" ]]; then
-        echo "openai:$openai_id"
-      fi
-      ;;
-    copilot)
-      local copilot_token=$(jq -r '.["github-copilot"].access // empty' "$auth_file" 2>/dev/null)
-      if [[ -n "$copilot_token" && "$copilot_token" != "null" ]]; then
-        echo "copilot:${copilot_token:0:16}"
-      fi
-      ;;
-  esac
+  auth_account_id_for_provider_from_file "$auth_file" "$provider"
 }
 
 # Get the first account ID from auth file for legacy callers.
 get_account_id() {
-  local auth_file="$1"
-  local provider
-
-  for provider in openai copilot; do
-    local account_id=$(get_account_id_for_provider "$auth_file" "$provider")
-    if [[ -n "$account_id" ]]; then
-      echo "$account_id"
-      return
-    fi
-  done
+  auth_account_id_from_file "$1"
 }
 
 # Detect provider type from auth file
 get_provider_from_auth() {
-  local auth_file="$1"
-  if [[ -f "$auth_file" ]]; then
-    # Check which provider has valid auth
-    if jq -e '.openai.accountId != null' "$auth_file" >/dev/null 2>&1; then
-      echo "openai"
-    elif jq -e '.["github-copilot"].access != null' "$auth_file" >/dev/null 2>&1; then
-      echo "copilot"
-    fi
-  fi
+  auth_provider_from_file "$1"
 }
 
 get_plan_type_for_provider() {
@@ -794,12 +833,19 @@ find_reusable_account_slot() {
 }
 
 update_account_config_entry() {
+  with_file_lock "$ACCOUNTS_CONF" update_account_config_entry_unlocked "$@"
+}
+
+update_account_config_entry_unlocked() {
   local name="$1"
   local type="$2"
   local shortcut="$3"
   local display_name="$4"
   local tmp_file="${ACCOUNTS_CONF}.tmp"
   local line
+
+  ensure_parent_dir "$ACCOUNTS_CONF"
+  [[ -f "$ACCOUNTS_CONF" ]] || : > "$ACCOUNTS_CONF"
 
   : > "$tmp_file"
   while IFS= read -r line || [[ -n "$line" ]]; do
@@ -811,6 +857,35 @@ update_account_config_entry() {
   done < "$ACCOUNTS_CONF"
 
   mv "$tmp_file" "$ACCOUNTS_CONF"
+}
+
+append_account_config_entry_unlocked() {
+  local name="$1"
+  local type="$2"
+  local shortcut="$3"
+  local display_name="$4"
+
+  ensure_parent_dir "$ACCOUNTS_CONF"
+  [[ -f "$ACCOUNTS_CONF" ]] || : > "$ACCOUNTS_CONF"
+  print -r -- "${name}:${type}:${shortcut}:${display_name}" >> "$ACCOUNTS_CONF"
+}
+
+append_account_config_entry() {
+  with_file_lock "$ACCOUNTS_CONF" append_account_config_entry_unlocked "$@"
+}
+
+remove_account_config_entry_unlocked() {
+  local acc="$1"
+  local tmp=$(mktemp)
+
+  ensure_parent_dir "$ACCOUNTS_CONF"
+  [[ -f "$ACCOUNTS_CONF" ]] || : > "$ACCOUNTS_CONF"
+  grep -v "^${acc}:" "$ACCOUNTS_CONF" > "$tmp"
+  mv "$tmp" "$ACCOUNTS_CONF"
+}
+
+remove_account_config_entry() {
+  with_file_lock "$ACCOUNTS_CONF" remove_account_config_entry_unlocked "$1"
 }
 
 write_provider_auth() {
@@ -886,7 +961,7 @@ import_provider_account() {
       update_account_config_entry "$name" "$plan_type" "$shortcut" "$display_name"
     fi
   else
-    echo "${name}:${plan_type}:${shortcut}:${display_name}" >> "$ACCOUNTS_CONF"
+    append_account_config_entry "$name" "$plan_type" "$shortcut" "$display_name"
   fi
 
   echo -e "${GREEN}Auto-added:${NC} ${BOLD}${display_name:-$name}${NC} (${plan_type}) -> ${BOLD}${shortcut}${NC}"
@@ -963,6 +1038,10 @@ get_type_color() {
 
 # Update config file with display name
 update_display_name() {
+  with_file_lock "$ACCOUNTS_CONF" update_display_name_unlocked "$@"
+}
+
+update_display_name_unlocked() {
   local acc=$1
   local display_name=$2
   local shortcut="${ACCOUNT_SHORTCUTS[$acc]}"
@@ -1230,6 +1309,202 @@ setup_accounts() {
   echo -e "${DIM}Accounts share sessions/plugins via symlinks, auth is isolated.${NC}"
 }
 
+doctor_print_check() {
+  local ok="$1"
+  local label="$2"
+  local detail="$3"
+
+  if [[ "$ok" == "true" ]]; then
+    echo -e "  ${GREEN}✓${NC} ${label}${detail:+ - ${detail}}"
+  else
+    echo -e "  ${RED}✗${NC} ${label}${detail:+ - ${detail}}"
+  fi
+}
+
+doctor_dependencies() {
+  local issues=0
+
+  echo ""
+  echo -e "${BOLD}Dependencies${NC}"
+
+  local dep
+  for dep in jq codex curl expect; do
+    if command -v "$dep" >/dev/null 2>&1; then
+      doctor_print_check true "$dep" "$(command -v "$dep")"
+    else
+      doctor_print_check false "$dep" "not installed"
+      issues=$((issues + 1))
+    fi
+  done
+
+  return $issues
+}
+
+doctor_wrapper() {
+  local issues=0
+  local expected_wrapper="$HOME/.local/bin/opencode"
+  local wrapper_target=""
+
+  echo ""
+  echo -e "${BOLD}Wrapper${NC}"
+
+  if [[ -f "$expected_wrapper" ]]; then
+    doctor_print_check true "wrapper file" "$expected_wrapper"
+  else
+    doctor_print_check false "wrapper file" "$expected_wrapper missing"
+    issues=$((issues + 1))
+  fi
+
+  if command -v opencode >/dev/null 2>&1; then
+    wrapper_target="$(command -v opencode)"
+    if [[ "$wrapper_target" == "$expected_wrapper" ]]; then
+      doctor_print_check true "wrapper active" "$wrapper_target"
+    else
+      doctor_print_check false "wrapper active" "$wrapper_target"
+      issues=$((issues + 1))
+    fi
+  else
+    doctor_print_check false "wrapper active" "opencode not found in PATH"
+    issues=$((issues + 1))
+  fi
+
+  local helper_path="${0:A:h}/ai-switch-auth"
+  if [[ -f "$helper_path" ]]; then
+    doctor_print_check true "shared auth helper" "$helper_path"
+  else
+    doctor_print_check false "shared auth helper" "$helper_path missing"
+    issues=$((issues + 1))
+  fi
+
+  return $issues
+}
+
+doctor_config() {
+  local issues=0
+  local line_no=0
+  local line
+  local -A seen_shortcuts
+
+  echo ""
+  echo -e "${BOLD}Config${NC}"
+
+  if [[ ! -f "$ACCOUNTS_CONF" ]]; then
+    doctor_print_check false "config file" "$ACCOUNTS_CONF missing"
+    return 1
+  fi
+
+  doctor_print_check true "config file" "$ACCOUNTS_CONF"
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line_no=$((line_no + 1))
+    [[ -z "$line" || "$line" =~ ^#.*$ ]] && continue
+
+    local name=""
+    local type=""
+    local shortcut=""
+    local display_name=""
+    IFS=: read -r name type shortcut display_name <<< "$line"
+
+    if [[ -z "$name" || -z "$type" || -z "$shortcut" ]]; then
+      doctor_print_check false "invalid config line" "line ${line_no}: ${line}"
+      issues=$((issues + 1))
+      continue
+    fi
+
+    if [[ -n "${seen_shortcuts[$shortcut]:-}" ]]; then
+      doctor_print_check false "duplicate shortcut: ${shortcut}" "lines ${seen_shortcuts[$shortcut]} and ${line_no}"
+      issues=$((issues + 1))
+    else
+      seen_shortcuts[$shortcut]="$line_no"
+    fi
+  done < "$ACCOUNTS_CONF"
+
+  return $issues
+}
+
+doctor_accounts() {
+  local issues=0
+  local line
+
+  echo ""
+  echo -e "${BOLD}Accounts${NC}"
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" || "$line" =~ ^#.*$ ]] && continue
+
+    local name=""
+    local type=""
+    local shortcut=""
+    local display_name=""
+    IFS=: read -r name type shortcut display_name <<< "$line"
+    [[ -z "$name" || -z "$type" || -z "$shortcut" ]] && continue
+
+    local auth_file="$(get_account_auth_file "$name")"
+    if [[ -f "$auth_file" ]]; then
+      doctor_print_check true "$name auth.json" "$auth_file"
+    else
+      doctor_print_check false "$name missing auth.json" "$auth_file"
+      issues=$((issues + 1))
+    fi
+
+    local account_dir="$(get_account_data_dir "$name")"
+    if [[ -d "$account_dir" ]]; then
+      local broken_link_found=false
+      local entry
+      for entry in "$account_dir"/*(DN@); do
+        if [[ -L "$entry" && ! -e "$entry" ]]; then
+          doctor_print_check false "$name broken symlink" "$entry"
+          issues=$((issues + 1))
+          broken_link_found=true
+        fi
+      done
+
+      if [[ "$broken_link_found" == "false" ]]; then
+        doctor_print_check true "$name symlinks" "no broken symlinks"
+      fi
+    else
+      doctor_print_check false "$name data dir" "$account_dir missing"
+      issues=$((issues + 1))
+    fi
+  done < "$ACCOUNTS_CONF"
+
+  return $issues
+}
+
+doctor() {
+  local issues=0
+  local section_status=0
+
+  echo ""
+  echo -e "${BOLD}AI Doctor${NC}"
+  echo "========="
+
+  doctor_dependencies
+  section_status=$?
+  issues=$((issues + section_status))
+
+  doctor_wrapper
+  section_status=$?
+  issues=$((issues + section_status))
+
+  doctor_config
+  section_status=$?
+  issues=$((issues + section_status))
+
+  doctor_accounts
+  section_status=$?
+  issues=$((issues + section_status))
+
+  echo ""
+  if (( issues == 0 )); then
+    echo -e "${GREEN}No issues found.${NC}"
+    return 0
+  fi
+
+  echo -e "${RED}${issues} issue(s) found.${NC}"
+  return 1
+}
+
 # Show status of all accounts
 show_status() {
   echo ""
@@ -1284,6 +1559,7 @@ show_status() {
   echo "  ai codex <shortcut> Launch Codex with account"
   echo "  ai usage <shortcut> Show plan & usage info"
   echo "  ai renew usage      Refresh usage data for all supported accounts"
+  echo "  ai doctor           Check dependencies and account setup"
   echo "  ai add [TYPE]       Add account (free/plus/copilot/api)"
   echo "  ai rm <shortcut>    Remove account"
   echo ""
@@ -1347,7 +1623,7 @@ add_account() {
   fi
   
   # Add to config
-  echo "${name}:${type}:${shortcut}:" >> "$ACCOUNTS_CONF"
+  append_account_config_entry "$name" "$type" "$shortcut" ""
   echo -e "${GREEN}Added:${NC} ${name} (${type}) -> ${BOLD}${shortcut}${NC}"
   
   # Setup data directory with symlinks
@@ -1396,9 +1672,7 @@ remove_account() {
   read -r delete_data
   
   # Remove from config
-  local tmp=$(mktemp)
-  grep -v "^${acc}:" "$ACCOUNTS_CONF" > "$tmp"
-  mv "$tmp" "$ACCOUNTS_CONF"
+  remove_account_config_entry "$acc"
   echo -e "${GREEN}Removed from config${NC}"
   
   # Optionally delete data
@@ -1712,6 +1986,9 @@ case "$1" in
   usage|u)
     show_usage "$2"
     ;;
+  doctor)
+    doctor
+    ;;
   renew)
     renew_command "$2"
     ;;
@@ -1726,6 +2003,7 @@ case "$1" in
     echo "  ai codex <shortcut> Launch Codex with account"
     echo "  ai usage <shortcut> Show account usage/plan info"
     echo "  ai renew usage      Refresh usage data for all supported accounts"
+    echo "  ai doctor           Check dependencies and account setup"
     echo "  ai add [TYPE]       Add account (free/plus/copilot/api)"
     echo "  ai rm <shortcut>    Remove account"
     echo "  ai rename <s> <n>   Set display name"

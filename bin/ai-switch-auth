@@ -1,0 +1,60 @@
+auth_openai_account_id_from_file() {
+  local auth_file="$1"
+
+  [[ ! -f "$auth_file" ]] && return
+
+  local account_id=$(jq -r '.openai.accountId // .tokens.accountId // .tokens.account_id // empty' "$auth_file" 2>/dev/null)
+  if [[ -n "$account_id" && "$account_id" != "null" ]]; then
+    printf '%s\n' "$account_id"
+  fi
+}
+
+auth_copilot_access_token_from_file() {
+  local auth_file="$1"
+
+  [[ ! -f "$auth_file" ]] && return
+
+  local access_token=$(jq -r '.["github-copilot"].access // .copilot.accessToken // empty' "$auth_file" 2>/dev/null)
+  if [[ -n "$access_token" && "$access_token" != "null" ]]; then
+    printf '%s\n' "$access_token"
+  fi
+}
+
+auth_account_id_for_provider_from_file() {
+  local auth_file="$1"
+  local provider="$2"
+
+  case "$provider" in
+    openai)
+      local openai_id=$(auth_openai_account_id_from_file "$auth_file")
+      [[ -n "$openai_id" ]] && printf 'openai:%s\n' "$openai_id"
+      ;;
+    copilot)
+      local copilot_token=$(auth_copilot_access_token_from_file "$auth_file")
+      [[ -n "$copilot_token" ]] && printf 'copilot:%s\n' "${copilot_token:0:16}"
+      ;;
+  esac
+}
+
+auth_account_id_from_file() {
+  local auth_file="$1"
+  local provider
+
+  for provider in openai copilot; do
+    local account_id=$(auth_account_id_for_provider_from_file "$auth_file" "$provider")
+    if [[ -n "$account_id" ]]; then
+      printf '%s\n' "$account_id"
+      return
+    fi
+  done
+}
+
+auth_provider_from_file() {
+  local auth_file="$1"
+
+  if [[ -n "$(auth_openai_account_id_from_file "$auth_file")" ]]; then
+    printf 'openai\n'
+  elif [[ -n "$(auth_copilot_access_token_from_file "$auth_file")" ]]; then
+    printf 'copilot\n'
+  fi
+}

@@ -16,8 +16,10 @@ mkdir -p "$CONFIG_DIR"
 
 # Copy scripts
 cp "$SCRIPT_DIR/bin/ai-switch" "$INSTALL_DIR/ai-switch"
+cp "$SCRIPT_DIR/bin/ai-switch-auth" "$INSTALL_DIR/ai-switch-auth"
 cp "$SCRIPT_DIR/bin/opencode-wrapper" "$INSTALL_DIR/opencode"
 chmod +x "$INSTALL_DIR/ai-switch"
+chmod +x "$INSTALL_DIR/ai-switch-auth"
 chmod +x "$INSTALL_DIR/opencode"
 
 # Create default config if not exists
