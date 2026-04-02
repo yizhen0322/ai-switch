@@ -476,6 +476,8 @@ get_copilot_usage() {
   [[ -z "$access_token" || "$access_token" == "null" ]] && return
 
   curl -fsSL \
+    --connect-timeout 3 \
+    --max-time 8 \
     -H "Accept: application/json" \
     -H "Authorization: token $access_token" \
     -H "Editor-Version: vscode/1.96.2" \
@@ -1466,6 +1468,7 @@ show_usage() {
   local type="${ACCOUNT_TYPES[$acc]}"
   local type_color=$(get_type_color "$type")
   local display_name=$(get_display_name "$acc")
+  local email=""
   
   local data_home="$(get_account_data_home "$acc")"
   local app_server_home="$(get_account_data_dir "$acc")"
@@ -1485,17 +1488,22 @@ show_usage() {
     return 1
   fi
   
-  echo ""
-  echo -e "${BOLD}Account: ${display_name:-$acc}${NC} ${type_color}(${type})${NC}"
-  echo "================================"
-  
-  # Try to get email from account auth
-  local email=$(get_email "$acc")
+  # Try to get email from account auth before rendering the title so
+  # prefix-style legacy names upgrade in the same invocation.
+  email=$(get_email "$acc")
   if [[ -n "$email" ]]; then
     local current_display="${ACCOUNT_NAMES[$acc]}"
     if [[ -z "$current_display" || "$current_display" == "${email%%@*}" ]]; then
       update_display_name "$acc" "$email"
+      display_name="$email"
     fi
+  fi
+
+  echo ""
+  echo -e "${BOLD}Account: ${display_name:-$acc}${NC} ${type_color}(${type})${NC}"
+  echo "================================"
+
+  if [[ -n "$email" ]]; then
     echo -e "Email: ${email}"
   fi
   

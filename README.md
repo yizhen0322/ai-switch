@@ -7,7 +7,7 @@ A multi-account manager for [OpenCode](https://opencode.ai) / [Codex](https://gi
 - **Multi-account support**: Manage multiple ChatGPT Free, Plus, and GitHub Copilot accounts
 - **Account isolation**: Each account has isolated authentication
 - **Shared sessions**: All accounts share the same session history and plugins
-- **Rate limit tracking**: View real-time usage limits for ChatGPT accounts (5-hour and weekly)
+- **Rate limit tracking**: View cached ChatGPT limits and live GitHub Copilot usage
 - **Auto-detection**: Automatically detects and adds new accounts when using `/connect`
 - **Quick shortcuts**: Launch accounts with simple aliases like `f1`, `p1`, `c1`
 
@@ -83,15 +83,19 @@ AI Multi-Account Status
 ========================
 
 FREE Accounts:
-  ● f1  john  0KB  72% left (14:30 on 01 Apr)
-  ● f2  work  0KB  45% left (16:00 on 01 Apr)
+  ● f1  john@example.com  72% left (14:30 on 01 Apr)
+  ● f2  work@example.com  45% left (16:00 on 01 Apr)
 
 PLUS Accounts:
-  ● p1  premium  0KB  5h limit 90% left | Weekly limit 85% left
+  ● p1  premium@example.com  5h limit 90% left (14:30 on 01 Apr) | Weekly limit 85% left (00:00 on 07 Apr)
+
+COPILOT Accounts:
+  ● c1  octocat  84% left
 
 Commands:
   ai                  Show this status
   ai <shortcut>       Launch account (e.g., ai f1)
+  ai codex <shortcut> Launch Codex with account
   ai usage <shortcut> Show plan & usage info
   ai renew usage      Refresh usage data for all supported accounts
   ai add [TYPE]       Add account (free/plus/copilot/api)
@@ -142,7 +146,7 @@ ai renew usage
 
 Output:
 ```
-Account: john (free)
+Account: john@example.com (free)
 ================================
 Email: john@example.com
 
@@ -150,7 +154,7 @@ Usage Limits:
   ████████████░░░░░░░░ 28% left (14:30 on 01 Apr)
   Plan: free
 
-Local data: 156KB
+Data from Codex app-server
 ```
 
 ### Auto-Detection
@@ -209,10 +213,10 @@ Limits are cached and refreshed automatically when exiting OpenCode.
 
 ```
 # Format: name:type:shortcut:display_name
-free1:free:f1:john
-free2:free:f2:work
-plus1:plus:p1:premium
-copilot1:copilot:c1:github
+free1:free:f1:john@example.com
+free2:free:f2:work@example.com
+plus1:plus:p1:premium@example.com
+copilot1:copilot:c1:octocat
 ```
 
 ### Aliases

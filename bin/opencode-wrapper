@@ -14,20 +14,14 @@ get_account_id_from_file() {
   local auth_file="$1"
   [[ ! -f "$auth_file" ]] && return
   
-  # Try OpenAI format (.openai.accessToken)
-  local token=$(jq -r '.openai.accessToken // empty' "$auth_file" 2>/dev/null)
-  if [[ -n "$token" ]]; then
-    local payload=$(echo "$token" | cut -d'.' -f2 | base64 -d 2>/dev/null)
-    local account_id=$(echo "$payload" | jq -r '.https://api\\.openai\\.com/profile.account_id // empty' 2>/dev/null)
-    if [[ -n "$account_id" ]]; then
-      echo "openai:$account_id"
-      return
-    fi
+  local account_id=$(jq -r '.openai.accountId // .tokens.accountId // .tokens.account_id // empty' "$auth_file" 2>/dev/null)
+  if [[ -n "$account_id" && "$account_id" != "null" ]]; then
+    echo "openai:$account_id"
+    return
   fi
   
-  # Try GitHub Copilot format (.copilot.accessToken)
-  local copilot_token=$(jq -r '.copilot.accessToken // empty' "$auth_file" 2>/dev/null)
-  if [[ -n "$copilot_token" ]]; then
+  local copilot_token=$(jq -r '.["github-copilot"].access // .copilot.accessToken // empty' "$auth_file" 2>/dev/null)
+  if [[ -n "$copilot_token" && "$copilot_token" != "null" ]]; then
     echo "copilot:${copilot_token:0:16}"
     return
   fi

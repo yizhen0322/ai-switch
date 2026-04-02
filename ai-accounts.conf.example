@@ -3,8 +3,8 @@
 # Types: free, plus, copilot, api
 #
 # Examples:
-# free1:free:f1:john
-# plus1:plus:p1:premium
-# copilot1:copilot:c1:github
+# free1:free:f1:john@example.com
+# plus1:plus:p1:premium@example.com
+# copilot1:copilot:c1:octocat
 
 free1:free:f1:
